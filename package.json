@@ -22,8 +22,8 @@
     "node": ">=18"
   },
   "dependencies": {
+    "@distube/ytdl-core": "^4.16.12",
     "telegraf": "^4.16.3",
-    "yt-search": "^2.13.1",
-    "ytdl-core": "^4.11.5"
+    "yt-search": "^2.13.1"
   }
 }

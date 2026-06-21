@@ -4,7 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const { Telegraf } = require('telegraf');
 const ytSearch = require('yt-search');
-const ytdl = require('ytdl-core');
+const ytdl = require('@distube/ytdl-core');
 
 const { MusicQueueManager } = require('./src/queue');
 
@@ -45,6 +45,38 @@ if (!BOT_TOKEN) {
 // Telegram bot uploads are capped at 50 MB. Skip anything obviously too long.
 const MAX_DURATION_SECONDS = Number(process.env.MAX_DURATION_SECONDS || 60 * 20);
 
+// ---------------------------------------------------------------------------
+// Optional YouTube cookies. YouTube blocks downloads from datacenter IPs with
+// "Sign in to confirm you're not a bot"; supplying cookies from a logged-in
+// browser session works around it. Provide either an inline JSON array in
+// YOUTUBE_COOKIES or a path to a JSON file in YOUTUBE_COOKIES_FILE. The JSON
+// is the cookie array exported by extensions like "Get cookies.txt LOCALLY"
+// (objects with at least { name, value }).
+// ---------------------------------------------------------------------------
+function buildYtdlAgent() {
+  const inline = process.env.YOUTUBE_COOKIES;
+  const file = process.env.YOUTUBE_COOKIES_FILE;
+  let raw;
+  if (inline && inline.trim()) {
+    raw = inline;
+  } else if (file && fs.existsSync(path.resolve(__dirname, file))) {
+    raw = fs.readFileSync(path.resolve(__dirname, file), 'utf8');
+  } else {
+    return undefined;
+  }
+  try {
+    const cookies = JSON.parse(raw);
+    const agent = ytdl.createAgent(cookies);
+    console.log(`Loaded ${Array.isArray(cookies) ? cookies.length : 0} YouTube cookie(s).`);
+    return agent;
+  } catch (err) {
+    console.warn(`Could not load YouTube cookies: ${err.message}. Continuing without them.`);
+    return undefined;
+  }
+}
+
+const ytdlAgent = buildYtdlAgent();
+
 const bot = new Telegraf(BOT_TOKEN);
 
 // ---------------------------------------------------------------------------
@@ -81,6 +113,7 @@ async function playTrack(chatId, track, signal) {
     filter: 'audioonly',
     quality: 'highestaudio',
     highWaterMark: 1 << 25,
+    ...(ytdlAgent ? { agent: ytdlAgent } : {}),
   });
 
   // Capture stream errors so a failed download rejects the send instead of
