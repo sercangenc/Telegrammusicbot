@@ -1,10 +1,12 @@
 'use strict';
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
+const crypto = require('crypto');
+const { spawn } = require('child_process');
 const { Telegraf } = require('telegraf');
 const ytSearch = require('yt-search');
-const ytdl = require('@distube/ytdl-core');
 
 const { MusicQueueManager } = require('./src/queue');
 
@@ -45,37 +47,20 @@ if (!BOT_TOKEN) {
 // Telegram bot uploads are capped at 50 MB. Skip anything obviously too long.
 const MAX_DURATION_SECONDS = Number(process.env.MAX_DURATION_SECONDS || 60 * 20);
 
-// ---------------------------------------------------------------------------
-// Optional YouTube cookies. YouTube blocks downloads from datacenter IPs with
-// "Sign in to confirm you're not a bot"; supplying cookies from a logged-in
-// browser session works around it. Provide either an inline JSON array in
-// YOUTUBE_COOKIES or a path to a JSON file in YOUTUBE_COOKIES_FILE. The JSON
-// is the cookie array exported by extensions like "Get cookies.txt LOCALLY"
-// (objects with at least { name, value }).
-// ---------------------------------------------------------------------------
-function buildYtdlAgent() {
-  const inline = process.env.YOUTUBE_COOKIES;
-  const file = process.env.YOUTUBE_COOKIES_FILE;
-  let raw;
-  if (inline && inline.trim()) {
-    raw = inline;
-  } else if (file && fs.existsSync(path.resolve(__dirname, file))) {
-    raw = fs.readFileSync(path.resolve(__dirname, file), 'utf8');
-  } else {
-    return undefined;
-  }
-  try {
-    const cookies = JSON.parse(raw);
-    const agent = ytdl.createAgent(cookies);
-    console.log(`Loaded ${Array.isArray(cookies) ? cookies.length : 0} YouTube cookie(s).`);
-    return agent;
-  } catch (err) {
-    console.warn(`Could not load YouTube cookies: ${err.message}. Continuing without them.`);
-    return undefined;
-  }
-}
-
-const ytdlAgent = buildYtdlAgent();
+// Audio is downloaded with yt-dlp (robust against YouTube changes) and converted
+// with ffmpeg. Both must be installed and on PATH (override paths if needed).
+const YT_DLP = process.env.YT_DLP_PATH || 'yt-dlp';
+// Only override ffmpeg discovery when explicitly configured; otherwise yt-dlp
+// finds ffmpeg/ffprobe on PATH on its own.
+const FFMPEG_LOCATION = process.env.FFMPEG_PATH || null;
+// The android_vr client serves formats that don't require JS-based signature
+// deciphering, avoiding HTTP 403s when no JS runtime is installed.
+const YT_DLP_PLAYER_CLIENT = process.env.YT_DLP_PLAYER_CLIENT || 'android_vr';
+// Optional Netscape-format cookies.txt to bypass "Sign in to confirm you're not
+// a bot" on datacenter IPs (export with a browser extension).
+const YOUTUBE_COOKIES_FILE = process.env.YOUTUBE_COOKIES_FILE
+  ? path.resolve(__dirname, process.env.YOUTUBE_COOKIES_FILE)
+  : null;
 
 const bot = new Telegraf(BOT_TOKEN);
 
@@ -96,63 +81,95 @@ function trackLabel(track) {
   return `${track.title}${dur}`;
 }
 
+// Extract an 11-char YouTube video id from a URL, or null for plain queries.
+function extractVideoId(input) {
+  const m = String(input).match(
+    /(?:v=|\/shorts\/|youtu\.be\/|\/embed\/|\/v\/)([A-Za-z0-9_-]{11})/
+  );
+  return m ? m[1] : null;
+}
+
+function abortError() {
+  const err = new Error('aborted');
+  err.name = 'AbortError';
+  return err;
+}
+
 // ---------------------------------------------------------------------------
-// Playback: download the track with ytdl-core and send it as an audio file.
-// Respects the AbortSignal so /skip and /stop can interrupt an in-flight send.
+// Download audio with yt-dlp into outPath (mp3). Rejects with AbortError if the
+// signal fires (killing the child process), or with the yt-dlp error otherwise.
+// ---------------------------------------------------------------------------
+function downloadAudio(url, outTemplate, signal) {
+  return new Promise((resolve, reject) => {
+    const args = [
+      '-f', 'bestaudio/best',
+      '-x', '--audio-format', 'mp3',
+      '--audio-quality', '0',
+      '--no-playlist',
+      '--no-progress',
+      '--no-warnings',
+      '--extractor-args', `youtube:player_client=${YT_DLP_PLAYER_CLIENT}`,
+      '-o', outTemplate,
+    ];
+    if (FFMPEG_LOCATION) {
+      args.push('--ffmpeg-location', FFMPEG_LOCATION);
+    }
+    if (YOUTUBE_COOKIES_FILE && fs.existsSync(YOUTUBE_COOKIES_FILE)) {
+      args.push('--cookies', YOUTUBE_COOKIES_FILE);
+    }
+    args.push(url);
+
+    const child = spawn(YT_DLP, args, { stdio: ['ignore', 'ignore', 'pipe'] });
+    let stderr = '';
+    child.stderr.on('data', (d) => { stderr += d.toString(); });
+
+    const onAbort = () => child.kill('SIGKILL');
+    signal.addEventListener('abort', onAbort, { once: true });
+
+    child.on('error', (err) => {
+      signal.removeEventListener('abort', onAbort);
+      reject(new Error(`Could not run yt-dlp (${YT_DLP}): ${err.message}`));
+    });
+    child.on('close', (code) => {
+      signal.removeEventListener('abort', onAbort);
+      if (signal.aborted) return reject(abortError());
+      if (code === 0) return resolve();
+      const lastLine = stderr.trim().split('\n').filter(Boolean).pop() || `exit code ${code}`;
+      return reject(new Error(lastLine));
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Playback: download the track with yt-dlp and send it as an audio file.
+// Respects the AbortSignal so /skip and /stop can interrupt an in-flight job.
 // ---------------------------------------------------------------------------
 async function playTrack(chatId, track, signal) {
-  if (signal.aborted) {
-    const err = new Error('aborted');
-    err.name = 'AbortError';
-    throw err;
-  }
+  if (signal.aborted) throw abortError();
 
   await bot.telegram.sendChatAction(chatId, 'upload_voice').catch(() => {});
 
-  const stream = ytdl(track.url, {
-    filter: 'audioonly',
-    quality: 'highestaudio',
-    highWaterMark: 1 << 25,
-    ...(ytdlAgent ? { agent: ytdlAgent } : {}),
-  });
-
-  // Capture stream errors so a failed download rejects the send instead of
-  // emitting an unhandled 'error' event that would crash the process.
-  let streamError = null;
-  const streamFailed = new Promise((_, reject) => {
-    stream.once('error', (err) => {
-      streamError = err;
-      reject(err);
-    });
-  });
-  streamFailed.catch(() => {});
-
-  const onAbort = () => stream.destroy(new Error('aborted'));
-  signal.addEventListener('abort', onAbort, { once: true });
+  const base = path.join(os.tmpdir(), `mb-${chatId}-${crypto.randomBytes(6).toString('hex')}`);
+  const outTemplate = `${base}.%(ext)s`;
+  const outPath = `${base}.mp3`;
 
   try {
-    await Promise.race([
-      bot.telegram.sendAudio(
-        chatId,
-        { source: stream },
-        {
-          title: track.title,
-          performer: track.author || 'Unknown',
-          caption: `Now playing: ${trackLabel(track)}`,
-        }
-      ),
-      streamFailed,
-    ]);
+    await downloadAudio(track.url, outTemplate, signal);
+    if (signal.aborted) throw abortError();
+    await bot.telegram.sendAudio(
+      chatId,
+      { source: outPath },
+      {
+        title: track.title,
+        performer: track.author || 'Unknown',
+        caption: `Now playing: ${trackLabel(track)}`,
+      }
+    );
   } catch (err) {
-    if (signal.aborted) {
-      const aborted = new Error('aborted');
-      aborted.name = 'AbortError';
-      throw aborted;
-    }
-    throw streamError || err;
+    if (signal.aborted) throw abortError();
+    throw err;
   } finally {
-    signal.removeEventListener('abort', onAbort);
-    if (!stream.destroyed) stream.destroy();
+    fs.promises.unlink(outPath).catch(() => {});
   }
 }
 
@@ -195,9 +212,9 @@ bot.command('play', async (ctx) => {
 
   let video;
   try {
-    if (ytdl.validateURL(query)) {
-      const info = await ytSearch({ videoId: ytdl.getVideoID(query) });
-      video = info;
+    const videoId = extractVideoId(query);
+    if (videoId) {
+      video = await ytSearch({ videoId });
     } else {
       const results = await ytSearch(query);
       video = results.videos && results.videos[0];
