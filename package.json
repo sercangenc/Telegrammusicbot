@@ -1,0 +1,29 @@
+{
+  "name": "musicbot",
+  "version": "1.0.0",
+  "description": "Telegram music bot that searches YouTube and sends tracks with a per-chat queue",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js",
+    "check": "node --check index.js && node --check src/queue.js"
+  },
+  "keywords": [
+    "telegram",
+    "bot",
+    "telegraf",
+    "music",
+    "youtube"
+  ],
+  "author": "",
+  "license": "ISC",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "telegraf": "^4.16.3",
+    "yt-search": "^2.13.1",
+    "ytdl-core": "^4.11.5"
+  }
+}
