@@ -83,26 +83,40 @@ async function playTrack(chatId, track, signal) {
     highWaterMark: 1 << 25,
   });
 
+  // Capture stream errors so a failed download rejects the send instead of
+  // emitting an unhandled 'error' event that would crash the process.
+  let streamError = null;
+  const streamFailed = new Promise((_, reject) => {
+    stream.once('error', (err) => {
+      streamError = err;
+      reject(err);
+    });
+  });
+  streamFailed.catch(() => {});
+
   const onAbort = () => stream.destroy(new Error('aborted'));
   signal.addEventListener('abort', onAbort, { once: true });
 
   try {
-    await bot.telegram.sendAudio(
-      chatId,
-      { source: stream },
-      {
-        title: track.title,
-        performer: track.author || 'Unknown',
-        caption: `Now playing: ${trackLabel(track)}`,
-      }
-    );
+    await Promise.race([
+      bot.telegram.sendAudio(
+        chatId,
+        { source: stream },
+        {
+          title: track.title,
+          performer: track.author || 'Unknown',
+          caption: `Now playing: ${trackLabel(track)}`,
+        }
+      ),
+      streamFailed,
+    ]);
   } catch (err) {
     if (signal.aborted) {
       const aborted = new Error('aborted');
       aborted.name = 'AbortError';
       throw aborted;
     }
-    throw err;
+    throw streamError || err;
   } finally {
     signal.removeEventListener('abort', onAbort);
     if (!stream.destroyed) stream.destroy();
@@ -218,15 +232,23 @@ bot.command('queue', (ctx) => {
 });
 
 // ---------------------------------------------------------------------------
-// Launch
+// Launch (only when run directly, so the bot stays importable for tests)
 // ---------------------------------------------------------------------------
-bot
-  .launch()
-  .then(() => console.log('Music bot is running. Press Ctrl+C to stop.'))
-  .catch((err) => {
-    console.error('Failed to launch bot:', err.message);
-    process.exit(1);
-  });
+function start() {
+  bot
+    .launch()
+    .then(() => console.log('Music bot is running. Press Ctrl+C to stop.'))
+    .catch((err) => {
+      console.error('Failed to launch bot:', err.message);
+      process.exit(1);
+    });
 
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+  process.once('SIGINT', () => bot.stop('SIGINT'));
+  process.once('SIGTERM', () => bot.stop('SIGTERM'));
+}
+
+if (require.main === module) {
+  start();
+}
+
+module.exports = { bot, manager, playTrack, start };
